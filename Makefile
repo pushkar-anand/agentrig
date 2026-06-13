@@ -1,5 +1,5 @@
-GO = /usr/local/go/bin/go
-TAGS = goolm
+GO   ?= go
+TAGS ?= goolm
 
 .PHONY: build vet test test-integration lint fmt
 
@@ -16,7 +16,7 @@ test-integration:
 	$(GO) test -tags "$(TAGS) integration" -race -run Integration ./channel/matrix/...
 
 lint:
-	$(GO) run honnef.co/go/tools/cmd/staticcheck@latest -tags $(TAGS) ./...
+	$(GO) tool staticcheck -tags $(TAGS) ./...
 
 fmt:
 	$(GO) fmt ./...
