@@ -6,39 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
-  test:
-    name: Build, vet & test
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Build
-        run: go build -tags goolm ./...
-
-      - name: Vet
-        run: go vet -tags goolm ./...
-
-      - name: Test
-        run: go test -tags goolm -race -count=1 ./...
-
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@latest -tags goolm ./...
+  ci:
+    uses: pushkar-anand/.github/.github/workflows/go-ci.yml@main
+    with:
+      build-tags: "goolm"
+      run-lint: true
