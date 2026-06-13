@@ -12,12 +12,13 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sync"
 	"time"
 
-	"github.com/rs/zerolog"
 	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/extension"
 	"github.com/yuin/goldmark/renderer/html"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
@@ -26,22 +27,36 @@ import (
 	"github.com/pushkar-anand/agentrig/channel"
 )
 
+// Option configures a Matrix channel.
+type Option func(*Matrix)
+
+// WithLogger sets the slog.Logger used for internal log output.
+// If not provided, slog.Default() is used.
+func WithLogger(l *slog.Logger) Option {
+	return func(m *Matrix) { m.log = l }
+}
+
 // Matrix is a Matrix channel that routes DMs to a MessageHandler.
 type Matrix struct {
 	cfg    Config
 	client *mautrix.Client
 	md     goldmark.Markdown
+	log    *slog.Logger
 	rooms  sync.Map // map[id.RoomID → *sync.Mutex]: serialises per-room handling
 }
 
 // New creates a Matrix channel from cfg. Call Start to begin receiving messages.
-func New(cfg Config) (*Matrix, error) {
+func New(cfg Config, opts ...Option) (*Matrix, error) {
 	client, err := mautrix.NewClient(cfg.HomeserverURL, id.UserID(cfg.UserID), cfg.AccessToken)
 	if err != nil {
 		return nil, fmt.Errorf("create matrix client: %w", err)
 	}
 
-	return &Matrix{cfg: cfg, client: client, md: newMarkdown()}, nil
+	m := &Matrix{cfg: cfg, client: client, md: newMarkdown(), log: slog.Default()}
+	for _, o := range opts {
+		o(m)
+	}
+	return m, nil
 }
 
 // Name implements channel.Channel.
@@ -68,6 +83,10 @@ func (m *Matrix) Start(ctx context.Context, handler channel.MessageHandler) erro
 		return fmt.Errorf("setup crypto: %w", err)
 	}
 
+	syncer.OnEventType(event.StateMember, func(ctx context.Context, evt *event.Event) {
+		m.handleInvite(ctx, evt)
+	})
+
 	syncer.OnEventType(event.EventMessage, func(ctx context.Context, evt *event.Event) {
 		m.handleMessage(ctx, evt, handler)
 	})
@@ -75,10 +94,27 @@ func (m *Matrix) Start(ctx context.Context, handler channel.MessageHandler) erro
 	return m.client.SyncWithContext(ctx)
 }
 
+// handleInvite auto-accepts room invites from allowed users.
+func (m *Matrix) handleInvite(ctx context.Context, evt *event.Event) {
+	content, ok := evt.Content.Parsed.(*event.MemberEventContent)
+	if !ok || content.Membership != event.MembershipInvite {
+		return
+	}
+	// Only the invite addressed to the bot matters.
+	if evt.GetStateKey() != m.cfg.UserID {
+		return
+	}
+	if !slices.Contains(m.cfg.AllowedUsers, evt.Sender.String()) {
+		m.log.WarnContext(ctx, "ignoring invite from unlisted user", "sender", evt.Sender.String())
+		return
+	}
+	if _, err := m.client.JoinRoomByID(ctx, evt.RoomID); err != nil {
+		m.log.ErrorContext(ctx, "failed to join room", "room", evt.RoomID.String(), "err", err)
+	}
+}
+
 // handleMessage processes a single inbound EventMessage.
 func (m *Matrix) handleMessage(ctx context.Context, evt *event.Event, handler channel.MessageHandler) {
-	log := zerolog.Ctx(ctx)
-
 	// Ignore own messages (echo suppression).
 	if evt.Sender == id.UserID(m.cfg.UserID) {
 		return
@@ -111,14 +147,20 @@ func (m *Matrix) handleMessage(ctx context.Context, evt *event.Event, handler ch
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Typing indicator while the handler runs (no-op when client is nil, e.g. in tests).
+	var eyesEventID id.EventID
 	if m.client != nil {
+		// 👀 reaction signals the message was received and is being processed.
+		if resp, err := m.client.SendReaction(ctx, evt.RoomID, evt.ID, "👀"); err != nil {
+			m.log.WarnContext(ctx, "failed to send eyes reaction", "err", err)
+		} else {
+			eyesEventID = resp.EventID
+		}
 		if _, err := m.client.UserTyping(ctx, evt.RoomID, true, 30*time.Second); err != nil {
-			log.Warn().Err(err).Msg("failed to send typing notification")
+			m.log.WarnContext(ctx, "failed to send typing notification", "err", err)
 		}
 		defer func() {
 			if _, err := m.client.UserTyping(ctx, evt.RoomID, false, 0); err != nil {
-				log.Warn().Err(err).Msg("failed to clear typing notification")
+				m.log.WarnContext(ctx, "failed to clear typing notification", "err", err)
 			}
 		}()
 	}
@@ -133,10 +175,10 @@ func (m *Matrix) handleMessage(ctx context.Context, evt *event.Event, handler ch
 
 	resp, err := handler(ctx, msg)
 	if err != nil {
-		log.Error().Err(err).Str("room", evt.RoomID.String()).Msg("handler error")
+		m.log.ErrorContext(ctx, "handler error", "room", evt.RoomID.String(), "err", err)
 		if m.client != nil {
 			if _, sendErr := m.client.SendText(ctx, evt.RoomID, "Sorry, something went wrong."); sendErr != nil {
-				log.Error().Err(sendErr).Msg("failed to send error message")
+				m.log.ErrorContext(ctx, "failed to send error message", "err", sendErr)
 			}
 		}
 		return
@@ -144,7 +186,17 @@ func (m *Matrix) handleMessage(ctx context.Context, evt *event.Event, handler ch
 
 	if m.client != nil {
 		if err := m.sendResponse(ctx, evt.RoomID, resp); err != nil {
-			log.Error().Err(err).Str("room", evt.RoomID.String()).Msg("failed to send response")
+			m.log.ErrorContext(ctx, "failed to send response", "room", evt.RoomID.String(), "err", err)
+			return
+		}
+		// Replace 👀 with ✅ once the response is delivered.
+		if eyesEventID != "" {
+			if _, err := m.client.RedactEvent(ctx, evt.RoomID, eyesEventID); err != nil {
+				m.log.WarnContext(ctx, "failed to redact eyes reaction", "err", err)
+			}
+		}
+		if _, err := m.client.SendReaction(ctx, evt.RoomID, evt.ID, "✅"); err != nil {
+			m.log.WarnContext(ctx, "failed to send check reaction", "err", err)
 		}
 	}
 }
@@ -201,5 +253,8 @@ func (m *Matrix) buildContent(resp channel.Response) (*event.MessageEventContent
 
 // newMarkdown returns the goldmark instance used for rendering.
 func newMarkdown() goldmark.Markdown {
-	return goldmark.New(goldmark.WithRendererOptions(html.WithUnsafe()))
+	return goldmark.New(
+		goldmark.WithExtensions(extension.GFM),
+		goldmark.WithRendererOptions(html.WithUnsafe()),
+	)
 }
